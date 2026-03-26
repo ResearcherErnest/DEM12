@@ -32,13 +32,25 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
   GRANT CONNECT ON DATABASE sales           TO metabase_user;
 EOSQL
 
-# PG 15+ revoked default CREATE on public schema — grant it explicitly
+# PG 15+ revoked default CREATE on public schema â€” grant it explicitly
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname airflow <<-EOSQL2
   GRANT CREATE ON SCHEMA public TO airflow_user;
   GRANT USAGE  ON SCHEMA public TO airflow_user;
 EOSQL2
 
+# Metabase schema grants + citext extension (required by Metabase migrations)
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname metabase <<-EOSQL3
+  CREATE EXTENSION IF NOT EXISTS citext;
   GRANT CREATE ON SCHEMA public TO metabase_user;
   GRANT USAGE  ON SCHEMA public TO metabase_user;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES    TO metabase_user;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO metabase_user;
 EOSQL3
+
+# Grant metabase_user read access to all sales tables (for dashboard queries)
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname sales <<-EOSQL4
+  GRANT USAGE  ON SCHEMA public TO metabase_user;
+  GRANT SELECT ON ALL TABLES IN SCHEMA public TO metabase_user;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES    TO metabase_user;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO metabase_user;
+EOSQL4

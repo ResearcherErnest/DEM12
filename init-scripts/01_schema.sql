@@ -118,6 +118,19 @@ CREATE TABLE IF NOT EXISTS pipeline_runs (
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_dag_run_id ON pipeline_runs (dag_run_id);
 CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status     ON pipeline_runs (status);
 
+-- 8. DATA_QUALITY_LOG — Tracks invalid files and rows
+-- ================================================================
+CREATE TABLE IF NOT EXISTS data_quality_log (
+    log_id          SERIAL          PRIMARY KEY,
+    dag_run_id      VARCHAR(255)    NOT NULL,
+    file_name       VARCHAR(500)    NOT NULL,
+    issue_type      VARCHAR(100)    NOT NULL,
+    error_message   TEXT,
+    logged_at       TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dq_log_dag_run_id ON data_quality_log (dag_run_id);
+
 -- GRANTS — sales_user gets full access, metabase_user gets read-only
 -- ================================================================
 GRANT ALL PRIVILEGES ON ALL TABLES    IN SCHEMA public TO sales_user;

@@ -18,7 +18,7 @@ done
 echo "MinIO connection established."
 
   # == Create buckets if they don't already exist =================
-for BUCKET in "$MINIO_RAW_BUCKET" "$MINIO_PROCESSED_BUCKET"; do
+for BUCKET in "$MINIO_RAW_BUCKET" "$MINIO_PROCESSED_BUCKET" "${MINIO_INVALID_BUCKET:-invalid-data}"; do
   if mc ls "$MC_ALIAS/$BUCKET" > /dev/null 2>&1; then
     echo "Bucket '$BUCKET' already exists — skipping."
   else
