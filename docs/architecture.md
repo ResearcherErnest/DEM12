@@ -1,94 +1,89 @@
 # Architecture & Data Flow
 
-## Component Overview
+This document details the internal systems architecture and data flow of the DEM12 platform.
+
+## 1. System Context Diagram
+Shows the high-level system components and their interactions.
 
 ```mermaid
 flowchart TD
-    GEN["Data Generator (3 CSVs: customers, products, sales)"]
-    MINIO["MinIO Object Storage :9000 API | :9001 Console"]
-    RAW["raw-data bucket customers_*.csv products_*.csv sales_*.csv"]
-    AF_WEB["Airflow Webserver :8080"]
-    AF_SCH["Airflow Scheduler LocalExecutor"]
-    PROC["processed-data bucket (archived CSVs)"]
+    User([Platform User / Analyst])
+    GEN[Data Generator]
+    MINIO[(MinIO Object Storage)]
+    AF[Apache Airflow]
+    PG[(PostgreSQL<br/>Data Warehouse)]
+    MB[Metabase BI]
 
-    subgraph PG ["PostgreSQL :5432"]
-        DB_SALES[("DB: sales (7 tbls) product_categories | products | customers | orders returned_orders | purchased_products pipeline_runs")]
-        DB_AF[("DB: airflow (Airflow metadata)")]
-        DB_MB[("DB: metabase (Metabase config)")]
-    end
-
-    MB["Metabase :3000 Dashboards & BI"]
-
-    GEN -->|"Upload 3 CSVs"| RAW
-    RAW -->|"Scheduled poll"| AF_SCH
-    AF_WEB <-->|"REST API / UI"| AF_SCH
-    AF_SCH -->|"download → validate → transform → load"| DB_SALES
-    AF_SCH -->|"archive"| PROC
-    AF_SCH -->|"metadata"| DB_AF
-    DB_SALES -->|"SQL queries"| MB
-    MB -->|"config store"| DB_MB
+    User -->|Views Dashboards| MB
+    User -.->|Triggers| GEN
+    GEN -->|Uploads Raw CSVs| MINIO
+    AF -->|Continuously Polls & Streams| MINIO
+    AF -->|Transforms & Loads| PG
+    MB -->|Executes SQL Queries| PG
+    AF -->|Archives Files| MINIO
 ```
 
----
-
-## DAG Task Graph
+## 2. Containerized Component Architecture
+Highlights the Docker services and internal networking.
 
 ```mermaid
 flowchart LR
-    R["run_data_generator (optional trigger)"]
-    D["download_from_minio ⬇ S3 → temp files (customers + products + sales)"]
-    V["validate_csv schema & nulls (per entity type)"]
-    T["transform_data clean + enrich + extract returns & categories"]
-    L["load_to_postgres bulk upsert categories → products → customers → orders → returns → aggregations"]
-    A["archive_file raw → processed"]
+    subgraph Docker Network: platform_network
+        direction TB
+        
+        subgraph Compute
+            AF_W[Airflow Webserver: 8080]
+            AF_S[Airflow Scheduler]
+            GEN_C[Data Generator]
+            MB_APP[Metabase App: 3000]
+            MB_INIT[Metabase Init]
+        end
+        
+        subgraph Storage & Persistence
+            PG_DB[(Postgres 16: 5432)]
+            MINIO_DB[(MinIO S3: 9000)]
+        end
 
-    R --> D --> V --> T --> L --> A
+        AF_S -->|Reads/Writes| MINIO_DB
+        AF_S -->|Bulk Upserts| PG_DB
+        MB_APP -->|Reads| PG_DB
+        MB_INIT -->|Configures| MB_APP
+        GEN_C -->|Uploads| MINIO_DB
+    end
 ```
 
----
 
-## Infrastructure
+## 3. Data Flow Execution Diagram
+Details the sequence of Airflow ETL processes.
 
-| Layer        | Technology              | Version       | Port        |
-|--------------|-------------------------|---------------|-------------|
-| Database     | PostgreSQL              | 16-alpine     | 5432        |
-| Object Store | MinIO                   | latest        | 9000 / 9001 |
-| Orchestrator | Apache Airflow          | 2.9.1         | 8080        |
-| BI / Dashboards | Metabase             | latest        | 3000        |
-| Generator    | Python 3.11-slim        | —             | —           |
+```mermaid
+sequenceDiagram
+    participant MinIO
+    participant Airflow
+    participant Postgres
+    
+    Airflow->>MinIO: discover_files (List Objects)
+    MinIO-->>Airflow: List of pending CSVs
+    
+    Airflow->>MinIO: request HEAD/Chunk (validate_csv)
+    MinIO-->>Airflow: First 10kb data
+    
+    alt Validation Failed
+        Airflow->>MinIO: Move to invalid-data bucket
+        Airflow->>Postgres: Log to data_quality_log
+    else Validation Passed
+        Airflow->>MinIO: Stream specific CSV (transform_data)
+        MinIO-->>Airflow: Stream Data chunks
+        Airflow->>Airflow: Process in 20k row batches (Pandas)
+        Airflow->>Airflow: Save intermediate Parquet parts
+        Airflow->>Postgres: bulk_upsert to Dimensions/Facts
+        Airflow->>Postgres: Log success to pipeline_runs
+        Airflow->>MinIO: Move to processed-data bucket
+    end
+```
 
 ---
 
 ## Data Model
 
 ![Database Schema](screenshots/dbschema.png)
-
----
-
-## Screenshots
-
-### DAG Run Status
-
-![DAG Run Status](screenshots/dagrunstatus.png)
-
-### MinIO — Raw Data Bucket
-
-![MinIO Raw Data](screenshots/miniorawdata.png)
-
-### MinIO — Processed Files Bucket
-
-![MinIO Processed Files](screenshots/minioproceedfiles.png)
-
-### Metabase Dashboard
-
-![Metabase Dashboard](screenshots/mbdashbord.png)
-
-### Monthly Revenue Chart
-
-![Monthly Revenue Chart](screenshots/cicdrunsuccessful.png)
-
-### Saved Questions Summary
-
-![Summary Questions](screenshots/summaryq.png)
-
-> For full dashboard documentation, see [dashboard.md](dashboard.md).
