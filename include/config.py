@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     minio_endpoint: str = Field(..., description="e.g. http://minio:9000")
     minio_raw_bucket: str = Field("raw-data")
     minio_processed_bucket: str = Field("processed-data")
+    minio_invalid_bucket: str = Field("invalid-data")
 
     # === Data Generator ======================================================
     generator_num_customers:    int = Field(1000, ge=10, le=1_000_000)

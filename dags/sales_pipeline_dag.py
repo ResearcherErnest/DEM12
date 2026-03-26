@@ -1,7 +1,7 @@
 """
 dags/sales_pipeline_dag.py
 ==========================
-Airflow DAG: MinIO → Validate → Transform → PostgreSQL → Archive
+Airflow DAG: MinIO (Streaming) → Validate → Batch Transform → PostgreSQL → Archive
 
 Processes three CSV file types per run:
   1. customers_*.csv  — customer dimension
@@ -20,11 +20,12 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import boto3
 import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from botocore.client import Config
+
+from minio import Minio
+from minio.commonconfig import CopySource
 
 # Airflow runs inside the container; include/ is on PYTHONPATH via volume mount
 from include.config import settings
@@ -32,6 +33,7 @@ from include.db_loader import (
     get_connection,
     insert_returned_orders,
     log_pipeline_run,
+    log_data_quality_issue,
     update_customer_lifetime_values,
     upsert_categories,
     upsert_customers,
@@ -64,36 +66,14 @@ DEFAULT_ARGS = {
 # === Helpers =============================================================
 
 
-def _s3_client():
-    return boto3.client(
-        "s3",
-        endpoint_url=settings.minio_endpoint,
-        aws_access_key_id=settings.minio_root_user,
-        aws_secret_access_key=settings.minio_root_password,
-        config=Config(signature_version="s3v4"),
-        region_name="us-east-1",
+def _get_minio_client():
+    endpoint = settings.minio_endpoint.replace("http://", "").replace("https://", "")
+    return Minio(
+        endpoint,
+        access_key=settings.minio_root_user,
+        secret_key=settings.minio_root_password,
+        secure=settings.minio_endpoint.startswith("https")
     )
-
-
-def _list_pending_files() -> list[str]:
-    """Return all object keys in the raw-data bucket."""
-    client = _s3_client()
-    resp = client.list_objects_v2(Bucket=settings.minio_raw_bucket)
-    return [obj["Key"] for obj in resp.get("Contents", [])]
-
-
-def _classify_files(keys: list[str]) -> dict[str, str | None]:
-    """Classify files by prefix: customers, products, sales."""
-    result: dict[str, str | None] = {"customers": None, "products": None, "sales": None}
-    for key in keys:
-        basename = key.lower()
-        if basename.startswith("customers"):
-            result["customers"] = key
-        elif basename.startswith("products"):
-            result["products"] = key
-        elif basename.startswith("sales"):
-            result["sales"] = key
-    return result
 
 
 def _on_failure_callback(context: dict) -> None:
@@ -153,153 +133,181 @@ def run_data_generator(**context) -> None:
             sys.path.remove(gen_path)
 
 
-def download_from_minio(**context) -> None:
-    """Download all pending CSVs (customers, products, sales) to temp files."""
-    all_files = _list_pending_files()
+def discover_files(**context) -> None:
+    """Discover pending CSVs without downloading natively to disk."""
+    client = _get_minio_client()
+    objects = client.list_objects(settings.minio_raw_bucket, recursive=True)
+    all_files = [obj.object_name for obj in objects]
+
     if not all_files:
         raise ValueError("No files found in MinIO raw-data bucket.")
 
-    classified = _classify_files(all_files)
+    classified: dict[str, list[str]] = {"customers": [], "products": [], "sales": []}
+    for key in all_files:
+        basename = key.lower()
+        if basename.startswith("customers"):
+            classified["customers"].append(key)
+        elif basename.startswith("products"):
+            classified["products"].append(key)
+        elif basename.startswith("sales"):
+            classified["sales"].append(key)
+
     logger.info("Classified files: %s", classified)
 
-    client = _s3_client()
-    local_paths: dict[str, str] = {}
-
-    for file_type, object_key in classified.items():
-        if object_key is None:
-            logger.warning("No %s file found in raw-data bucket.", file_type)
-            continue
-
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=".csv", delete=False, prefix=f"{file_type}_raw_"
-        )
-        client.download_fileobj(settings.minio_raw_bucket, object_key, tmp)
-        tmp.flush()
-        tmp.close()
-        local_paths[file_type] = tmp.name
-        logger.info("Downloaded %s → %s", object_key, tmp.name)
-
-    # Push all paths and keys via XCom
     ti = context["ti"]
     ti.xcom_push(key="classified_files", value=classified)
-    ti.xcom_push(key="local_paths", value=local_paths)
-    ti.xcom_push(key="all_object_keys", value=[k for k in classified.values() if k])
+    ti.xcom_push(key="all_object_keys", value=all_files)
 
 
 def validate_csv(**context) -> None:
-    """Validate each downloaded CSV against its expected schema."""
-    local_paths = context["ti"].xcom_pull(key="local_paths")
+    """Validate each pending CSV using a HeadSensor (reading first chunk only)."""
+    classified = context["ti"].xcom_pull(key="classified_files")
+    client = _get_minio_client()
+    valid_classified: dict[str, list[str]] = {"customers": [], "products": [], "sales": []}
+    
+    dag_run_id = context["run_id"]
 
-    # Validate customers
-    if "customers" in local_paths:
-        df = pd.read_csv(local_paths["customers"])
-        if df.empty:
-            raise ValueError("Customers CSV is empty.")
-        required = {"customer_id", "name", "email", "region", "signup_date"}
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"Customers CSV missing columns: {missing}")
-        logger.info("Customers validation passed: %d rows.", len(df))
+    for file_type, keys in classified.items():
+        for key in keys:
+            response = None
+            try:
+                # HeadSensor: Read a small chunk to check columns natively from stream
+                response = client.get_object(settings.minio_raw_bucket, key, offset=0, length=10000)
+                data = response.read().decode('utf-8').split('\n')
+                if not data or len(data) < 2:
+                    raise ValueError(f"{file_type.capitalize()} CSV is empty or too small.")
+                
+                header = [c.strip('\r"') for c in data[0].split(',')]
+                
+                if file_type == "customers":
+                    required = {"customer_id", "name", "email", "region", "signup_date"}
+                elif file_type == "products":
+                    required = {"product_id", "name", "category", "unit_price", "cost"}
+                else:
+                    required = {
+                        "order_id", "customer_id", "product_id",
+                        "quantity", "unit_price", "discount",
+                        "order_date", "status", "region"
+                    }
 
-    # Validate products
-    if "products" in local_paths:
-        df = pd.read_csv(local_paths["products"])
-        if df.empty:
-            raise ValueError("Products CSV is empty.")
-        required = {"product_id", "name", "category", "unit_price", "cost"}
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"Products CSV missing columns: {missing}")
-        logger.info("Products validation passed: %d rows.", len(df))
+                missing = required - set(header)
+                if missing:
+                    raise ValueError(f"Missing columns: {missing}")
+                
+                valid_classified[file_type].append(key)
+                logger.info("Validation passed for %s", key)
+                
+            except Exception as e:
+                logger.error("Validation failed for %s: %s", key, e)
+                # Move to invalid bucket
+                try:
+                    client.copy_object(
+                        settings.minio_invalid_bucket, key,
+                        CopySource(settings.minio_raw_bucket, key)
+                    )
+                    client.remove_object(settings.minio_raw_bucket, key)
+                except Exception as ex:
+                    logger.error("Failed to move invalid file to quarantine: %s", ex)
+                
+                # Log to DB
+                with get_connection() as conn:
+                    log_data_quality_issue(
+                        conn=conn,
+                        dag_run_id=dag_run_id,
+                        file_name=key,
+                        issue_type="validation_error",
+                        error_message=str(e),
+                    )
+            finally:
+                if response:
+                    response.close()
+                    response.release_conn()
 
-    # Validate sales/transactions
-    if "sales" in local_paths:
-        df = pd.read_csv(local_paths["sales"])
-        if df.empty:
-            raise ValueError("Sales CSV is empty.")
-        required = {
-            "order_id", "customer_id", "product_id",
-            "quantity", "unit_price", "discount",
-            "order_date", "status", "region",
-        }
-        missing = required - set(df.columns)
-        if missing:
-            raise ValueError(f"Sales CSV missing columns: {missing}")
-        logger.info("Sales validation passed: %d rows.", len(df))
+    context["ti"].xcom_push(key="valid_classified_files", value=valid_classified)
 
 
 def transform_data(**context) -> None:
-    """Clean & transform all CSVs; push cleaned parquet paths via XCom."""
-    local_paths = context["ti"].xcom_pull(key="local_paths")
-    cleaned_paths: dict[str, str] = {}
+    """Stream clean & transform CSVs in 20k row batches; write chunked parquet paths."""
+    valid_classified = context["ti"].xcom_pull(key="valid_classified_files")
+    client = _get_minio_client()
+    
+    cleaned_paths: dict[str, list[str]] = {"customers": [], "products": [], "sales": []}
     total_skipped = 0
-
-    # Transform customers
-    if "customers" in local_paths:
-        df_raw = pd.read_csv(local_paths["customers"])
-        df_clean, skipped = clean_customers(df_raw)
-        total_skipped += skipped
-        out = local_paths["customers"].replace(".csv", "_cleaned.parquet")
-        df_clean.to_parquet(out, index=False)
-        cleaned_paths["customers"] = out
-
-    # Transform products
-    if "products" in local_paths:
-        df_raw = pd.read_csv(local_paths["products"])
-        df_clean, skipped = clean_products(df_raw)
-        total_skipped += skipped
-        out = local_paths["products"].replace(".csv", "_cleaned.parquet")
-        df_clean.to_parquet(out, index=False)
-        cleaned_paths["products"] = out
-
-    # Transform sales/transactions
-    if "sales" in local_paths:
-        df_raw = pd.read_csv(local_paths["sales"])
-        df_clean, skipped = clean_and_transform(df_raw)
-        total_skipped += skipped
-        out = local_paths["sales"].replace(".csv", "_cleaned.parquet")
-        df_clean.to_parquet(out, index=False)
-        cleaned_paths["sales"] = out
-
+    
+    for file_type, keys in valid_classified.items():
+        for key in keys:
+            response = None
+            try:
+                logger.info("Streaming dataset for transformation: %s", key)
+                response = client.get_object(settings.minio_raw_bucket, key)
+                # Intelligent batching natively
+                chunk_iter = pd.read_csv(response, chunksize=20000)
+                
+                for i, chunk in enumerate(chunk_iter):
+                    if file_type == "customers":
+                        df_clean, skipped = clean_customers(chunk)
+                    elif file_type == "products":
+                        df_clean, skipped = clean_products(chunk)
+                    else:
+                        df_clean, skipped = clean_and_transform(chunk)
+                        
+                    total_skipped += skipped
+                    
+                    if not df_clean.empty:
+                        tmp = tempfile.NamedTemporaryFile(suffix=".parquet", delete=False, prefix=f"{file_type}_clean_{i}_")
+                        tmp.close()
+                        df_clean.to_parquet(tmp.name, index=False)
+                        cleaned_paths[file_type].append(tmp.name)
+                        
+            finally:
+                if response:
+                    response.close()
+                    response.release_conn()
+                    
     context["ti"].xcom_push(key="cleaned_paths", value=cleaned_paths)
     context["ti"].xcom_push(key="rows_skipped", value=total_skipped)
-    logger.info("Transformation complete. Cleaned paths: %s", cleaned_paths)
+    logger.info("Transformation complete. Cleaned chunks: %s", cleaned_paths)
 
 
 def load_to_postgres(**context) -> None:
     """
-    Bulk-upsert all entities into PostgreSQL in FK-safe order:
-    categories → products → customers → orders → returned_orders →
-    purchased_products → update lifetime values
+    Bulk-upsert all entities into PostgreSQL in FK-safe order from parquet chunks.
     """
     cleaned_paths = context["ti"].xcom_pull(key="cleaned_paths")
     rows_skipped = context["ti"].xcom_pull(key="rows_skipped") or 0
-    all_keys = context["ti"].xcom_pull(key="all_object_keys") or []
     dag_run_id = context["run_id"]
 
     total_rows_inserted = 0
 
     with get_connection() as conn:
         # 1. Load products + extract categories
-        products_df = None
-        category_map = {}
-        if "products" in cleaned_paths:
-            products_df = pd.read_parquet(cleaned_paths["products"])
-            cat_df = extract_categories(products_df)
+        products_df = []
+        for path in cleaned_paths.get("products", []):
+            products_df.append(pd.read_parquet(path))
+            
+        full_products_df = None
+        if products_df:
+            full_products_df = pd.concat(products_df).drop_duplicates(subset=["product_id"], keep="last")
+            cat_df = extract_categories(full_products_df)
             category_map = upsert_categories(cat_df, conn)
-            upsert_products(products_df, conn, category_map)
-            logger.info("Loaded %d products across %d categories.", len(products_df), len(category_map))
+            upsert_products(full_products_df, conn, category_map)
+            logger.info("Loaded %d products.", len(full_products_df))
 
         # 2. Load customers
-        if "customers" in cleaned_paths:
-            customers_df = pd.read_parquet(cleaned_paths["customers"])
-            upsert_customers(customers_df, conn)
+        for path in cleaned_paths.get("customers", []):
+            df = pd.read_parquet(path)
+            upsert_customers(df, conn)
 
         # 3. Load orders (transactions)
-        if "sales" in cleaned_paths:
-            orders_df = pd.read_parquet(cleaned_paths["sales"])
-            rows_inserted, _ = upsert_orders(orders_df, conn)
+        all_orders = []
+        for path in cleaned_paths.get("sales", []):
+            df = pd.read_parquet(path)
+            rows_inserted, _ = upsert_orders(df, conn)
             total_rows_inserted += rows_inserted
+            all_orders.append(df)
+            
+        if all_orders:
+            orders_df = pd.concat(all_orders)
 
             # 4. Extract and load returned orders
             returns_df = extract_returns(orders_df)
@@ -307,18 +315,23 @@ def load_to_postgres(**context) -> None:
                 insert_returned_orders(returns_df, conn)
 
             # 5. Build and upsert purchased_products aggregation
-            if products_df is not None:
-                agg_df = build_product_aggregations(orders_df, products_df)
+            if full_products_df is not None:
+                agg_df = build_product_aggregations(orders_df, full_products_df)
                 upsert_purchased_products(agg_df, conn)
 
             # 6. Update customer lifetime values
             update_customer_lifetime_values(conn)
 
         # 7. Log pipeline run
+        valid_classified = context["ti"].xcom_pull(key="valid_classified_files")
+        valid_keys = []
+        for v in valid_classified.values():
+            valid_keys.extend(v)
+            
         log_pipeline_run(
             conn=conn,
             dag_run_id=dag_run_id,
-            file_processed=", ".join(all_keys),
+            file_processed=", ".join(valid_keys) if valid_keys else "N/A",
             rows_inserted=total_rows_inserted,
             rows_skipped=rows_skipped,
             status="success",
@@ -332,40 +345,39 @@ def load_to_postgres(**context) -> None:
 
 def archive_file(**context) -> None:
     """Move all processed files from raw-data → processed-data bucket."""
-    all_keys = context["ti"].xcom_pull(key="all_object_keys") or []
-    client = _s3_client()
+    valid_classified = context["ti"].xcom_pull(key="valid_classified_files")
+    client = _get_minio_client()
 
-    for object_key in all_keys:
-        # Copy to processed bucket
-        client.copy_object(
-            Bucket=settings.minio_processed_bucket,
-            CopySource={"Bucket": settings.minio_raw_bucket, "Key": object_key},
-            Key=object_key,
-        )
-        # Delete from raw bucket
-        client.delete_object(Bucket=settings.minio_raw_bucket, Key=object_key)
-        logger.info("Archived '%s' → processed-data bucket.", object_key)
+    archived_count = 0
+    for keys in valid_classified.values():
+        for object_key in keys:
+            client.copy_object(
+                settings.minio_processed_bucket, object_key,
+                CopySource(settings.minio_raw_bucket, object_key)
+            )
+            client.remove_object(settings.minio_raw_bucket, object_key)
+            logger.info("Archived '%s' → processed-data bucket.", object_key)
+            archived_count += 1
 
-    # Cleanup temp files
-    local_paths = context["ti"].xcom_pull(key="local_paths") or {}
+    # Cleanup temp parquet chunks
     cleaned_paths = context["ti"].xcom_pull(key="cleaned_paths") or {}
-    for paths in [local_paths, cleaned_paths]:
-        for path in paths.values():
+    for paths in cleaned_paths.values():
+        for path in paths:
             try:
                 Path(path).unlink(missing_ok=True)
             except Exception:
                 pass
 
-    logger.info("Archived %d files to processed-data bucket.", len(all_keys))
+    logger.info("Archived %d files to processed-data bucket.", archived_count)
 
 
 # === DAG Definition =============================================
 with DAG(
     dag_id="sales_pipeline_dag",
-    description="E-Commerce sales ETL: MinIO → PostgreSQL (customers, products, orders, returns)",
+    description="E-Commerce ETL: MinIO → Validation → Batching Transform → PostgreSQL",
     default_args=DEFAULT_ARGS,
     start_date=datetime(2024, 1, 1),
-    schedule_interval="*/15 * * * *",
+    schedule_interval="*/30 * * * *",
     catchup=False,
     max_active_runs=1,
     tags=["sales", "etl", "minio", "postgres"],
@@ -377,9 +389,9 @@ with DAG(
         python_callable=run_data_generator,
     )
 
-    t_download = PythonOperator(
-        task_id="download_from_minio",
-        python_callable=download_from_minio,
+    t_discover = PythonOperator(
+        task_id="discover_files",
+        python_callable=discover_files,
     )
 
     t_validate = PythonOperator(
@@ -403,4 +415,4 @@ with DAG(
     )
 
     # === Task graph =============================================
-    t_generate >> t_download >> t_validate >> t_transform >> t_load >> t_archive
+    t_generate >> t_discover >> t_validate >> t_transform >> t_load >> t_archive

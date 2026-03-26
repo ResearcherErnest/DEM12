@@ -340,3 +340,30 @@ def log_pipeline_run(
         run_id = cur.fetchone()[0]
     logger.info("Logged pipeline_run #%d — status=%s", run_id, status)
     return run_id
+
+
+# === Data Quality Log ==========================================
+
+
+def log_data_quality_issue(
+    conn: psycopg2.extensions.connection,
+    dag_run_id: str,
+    file_name: str,
+    issue_type: str,
+    error_message: str,
+) -> int:
+    """Insert an error record into data_quality_log."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO data_quality_log
+                (dag_run_id, file_name, issue_type, error_message)
+            VALUES (%s, %s, %s, %s)
+            RETURNING log_id
+            """,
+            (dag_run_id, file_name, issue_type, error_message),
+        )
+        log_id = cur.fetchone()[0]
+    logger.warning("Logged Data Quality Issue #%d for %s: %s", log_id, file_name, issue_type)
+    return log_id
+
