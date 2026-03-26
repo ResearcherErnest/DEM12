@@ -12,7 +12,7 @@ x-airflow-common: &airflow-common
     PYTHONPATH: /opt/airflow
     # Install extra Python packages into the Airflow image at startup
     # (official method for apache/airflow base image without a custom Dockerfile)
-    _PIP_ADDITIONAL_REQUIREMENTS: "faker boto3>=1.34 pandas>=2.2 pyarrow>=15.0 psycopg2-binary>=2.9 pydantic>=2.6 pydantic-settings>=2.2 apache-airflow-providers-amazon>=8.19"
+    _PIP_ADDITIONAL_REQUIREMENTS: "faker boto3>=1.34 pandas>=2.2 pyarrow>=15.0 psycopg2-binary>=2.9 pydantic>=2.6 pydantic-settings>=2.2 apache-airflow-providers-amazon>=8.19 minio>=7.2.7"
     # Pass MinIO / Postgres settings so DAGs can read from include/config.py
     POSTGRES_HOST: ${POSTGRES_HOST}
     POSTGRES_PORT: ${POSTGRES_PORT}
@@ -22,8 +22,9 @@ x-airflow-common: &airflow-common
     MINIO_ROOT_USER: ${MINIO_ROOT_USER}
     MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     MINIO_ENDPOINT: ${MINIO_ENDPOINT}
-    MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET}
-    MINIO_PROCESSED_BUCKET: ${MINIO_PROCESSED_BUCKET}
+    MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET:-raw-data}
+    MINIO_PROCESSED_BUCKET: ${MINIO_PROCESSED_BUCKET:-processed-data}
+    MINIO_INVALID_BUCKET: ${MINIO_INVALID_BUCKET:-invalid-data}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./include:/opt/airflow/include
@@ -168,6 +169,23 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+
+  # === Metabase Init =========================================
+  metabase-init:
+    image: badouralix/curl-jq:alpine
+    container_name: platform_metabase_init
+    env_file: .env
+    environment:
+      MB_ADMIN_EMAIL: ${MB_ADMIN_EMAIL:-admin@data-platform.local}
+      MB_ADMIN_PASSWORD: ${MB_ADMIN_PASSWORD:-MetaAdmin2026!}
+      MB_DB_PASS: ${MB_DB_PASS}
+    volumes:
+      - ./metabase-init/metabase_setup.sh:/metabase_setup.sh
+    depends_on:
+      metabase:
+        condition: service_healthy
+    entrypoint: /bin/sh /metabase_setup.sh
+    restart: "no"
 
   # === Data Generator (run on-demand) ========================
   data-generator:
